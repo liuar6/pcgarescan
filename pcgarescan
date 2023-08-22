@@ -1,0 +1,772 @@
+#!/usr/bin/env Rscript
+library(optparse)
+options(stringsAsFactors = FALSE)
+options(scipen = 100)
+
+conf = character(0)
+conf["hmmbuild_command"] = "hmmbuild [hmmer_file] [input_file]"
+conf["hmmsearch_command"] = "hmmsearch --cpu [n_thread] --noali --notextw -Z 1 --domZ 1 -E 1e-14 --domE 1e-14 [hmmer_file] [protein_file] > [output_file]"
+conf["cd-hit-est_command"] = "cd-hit-est -T [n_thread] -G 0 -aS 0.8 -r 0 -i [input_file] -o [output_prefix]"
+conf["meme_command"] = "meme -nostatus -text -seed 317 -dna -searchsize 2000000 -nmotifs [option_nmotifs] -evt [option_evt] -minsites [option_minsites] -minw 15 -brief 1000000000 [input_file] > [output_file]"
+conf["mafft_command"] = "mafft --genafpair --maxiterate 1000 [input_file] > [output_file]"
+conf["alifold_command"] = "RNAalifold -f F --noPS --aln-stk=[output_prefix] [input_file]"
+conf["rscape_command"] = "R-scape --rna --C2 -s --outdir [output_dir] --outname [output_prefix] [input_file] > [output_file]"
+
+args = commandArgs(trailingOnly = TRUE)
+
+help_msg = "\
+Usage: pcgarescan [options]
+Description: Identifying functional RNA elements from upstream or downstream of protein-coding gene.
+
+Options:
+\t--infile\t\tinput hmmer profile or fasta file used to build hmmer profile [required].
+\t--outdir\t\tdirectory for all outputs [required].
+\t--prefix\t\tprefix for all output (default: input file name).
+\t--database\t\tfile providing the metadata of target genomes and proteins [required].
+\t--taxonomy\t\tfile providing the taxonomy information for target genomes [optional].
+
+\t--min_coverage\t\tminimal profile coverage to determine homologs (default: 0.7).	
+\t--min_score\t\tminimal bit score to determine homologs (default: 0).
+\t--seq_extend\t\textension of upstream and downstream regions for motif analysis (default: 1000).
+\t--min_seq_len\t\tminimal length of intergenic regions to be included in analysis (default: 100).
+		
+\t--motif_candidate_deduplicate\texclude duplicated sequence prior to motif analysis (default is on).
+\t--motif_candidate_min_level\tminimal taxonomy level to select unique representitives (default: 0).
+\t--motif_candidate_max_count\tnumber of candidates are reduced to this number based on taxonomy (default: 1000).
+\t--motif_candidate_min_count\tminimal number of candidates required to perform motif analysis (default: 10).
+		
+\t--n_motif\t\t\tmaximal number of motifs to find (default: 20).
+\t--motif_eval\t\t\tE-value threhold for motifs (default: 0.000001).
+\t--motif_min_site\t\tminimal number of sites for motifs (default: 10).
+		
+\t--entropy_pseudocount\t\tpseudocount for calculating entropy score (default: 1).
+	
+\t--cluster_pseudocount\t\tpseudocount added to motif matrix prior to motif comparing (default: 1).
+\t--cluster_base_function\t\tscoring function for pairwise base similarity, either 0 or 1 (default: 1).
+\t--cluster_gap_penalty\t\tgap penalty for motif comparing (default: 2).
+\t--cluster_edge_penalty\t\tedge penalty for motif comparing (default: 0.05).
+\t--cluster_method\t\thclust method for clustering the motifs (default: single).
+\t--cluster_cutoff\t\tsimilarity cutoff for motif clustering.
+		
+\t--msa_candidate_min_level\tminimal taxonomy level to select unique representitives for msa analysis (default: 0).
+\t--msa_candidate_max_count\tnumber of candidates are reduced to this number based on taxonomy for msa analysis (default: 1000).
+\t--msa_candidate_min_count\tminimal number of candidates required to perform msa analysis (default: 10).
+		
+\t--thread\t\t\tnumber of threads (unoptimized).
+"
+
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) {
+    cat(help_msg)
+    quit(status = 0)
+}
+
+option_list = list(
+    make_option(c("-i", "--infile"), dest = "infile", action = "store", type = "character"),
+    make_option(c("-o", "--outdir"), dest = "outdir", action = "store", type = "character"),
+    make_option("--prefix", dest = "outprefix", action = "store", type = "character"),
+    make_option("--database", dest = "database", action = "store", type = "character"),
+    make_option("--taxonomy", dest = "taxonomy", action = "store", type = "character"),
+    make_option("--min_coverage", dest = "min_coverage", action = "store", type = "numeric", default = 0.7),
+    make_option("--min_score", dest = "min_score", action = "store", type = "numeric", default = 0),
+    make_option("--seq_extend", dest = "seq_extend", action = "store", type = "integer", default = 1000),
+    make_option("--min_seq_len", dest = "min_seq_len", action = "store", type = "integer", default = 100),
+    make_option("--motif_candidate_deduplicate", dest = "motif_candidate_deduplicate", action = "store_true", type = "logical", default = T),
+    make_option("--motif_candidate_min_level", dest = "motif_candidate_min_level", action = "store", type = "integer", default = 0),
+    make_option("--motif_candidate_max_count", dest = "motif_candidate_max_count", action = "store", type = "integer", default = 1000),
+    make_option("--motif_candidate_min_count", dest = "motif_candidate_min_count", action = "store", type = "integer", default = 10),
+    make_option("--n_motif", dest = "meme_n_motif", action = "store", type = "integer", default = 20),
+    make_option("--motif_eval", dest = "meme_motif_eval", action = "store", type = "numeric", default = 0.000001),
+    make_option("--motif_min_site", dest = "meme_motif_min_site", action = "store", type = "integer", default = 10),
+    make_option("--entropy_pseudocount", dest = "entropy_pseudocount", action = "store", type = "numeric", default = 1),
+    make_option("--cluster_pseudocount", dest = "cluster_pseudocount", action = "store", type = "numeric", default = 1),
+    make_option("--cluster_base_function", dest = "cluster_base_function", action = "store", type = "character", default = 1),
+    make_option("--cluster_gap_penalty", dest = "cluster_gap_penalty", action = "store", type = "numeric", default = 2),
+    make_option("--cluster_edge_penalty", dest = "cluster_edge_penalty", action = "store", type = "numeric", default = 0.05),
+    make_option("--cluster_method", dest = "cluster_method", action = "store", type = "character", default = "single"),
+    make_option("--cluster_cutoff", dest = "cluster_cutoff", action = "store", type = "numeric", default = 6),
+    make_option("--msa_analysis", dest = "msa_analysis", action = "store_true", type = "logical", default = T),
+    make_option("--msa_candidate_min_level", dest = "msa_candidate_min_level", action = "store", type = "integer", default = 0),
+    make_option("--msa_candidate_max_count", dest = "msa_candidate_max_count", action = "store", type = "integer", default = 100),
+    make_option("--msa_candidate_min_count", dest = "msa_candidate_min_count", action = "store", type = "integer", default = 10 ),
+    make_option("--thread", dest = "thread", action = "store", type = "integer", default = 1),
+    make_option(c("-h", "--help"), dest = "help", action = "store_true", type = "logical", default = F)
+)
+option_parser = OptionParser(option_list = option_list, add_help_option = F)
+option = parse_args(option_parser, args = args)
+
+error_quit = function(message = "An unknown error is encountered."){
+    cat(message)
+    cat("\n")
+    quit(status = 1)
+}
+
+info = new.env()
+info$n_thread = option$thread
+if (is.na(info$n_thread) || info$n_thread <= 0) error_quit("Error, invalid --thread value.")
+info$input_file = option$infile
+if (is.null(info$input_file)) error_quit("Error, input file should be specificed.")
+if (!file.exists(info$input_file)) error_quit("Error, input file does not exist.")
+info$output_dir = option$outdir
+if (is.null(info$output_dir)) error_quit("Error, output directory should be specificed.")
+if (!file.exists(info$output_dir)) ret = dir.create(info$output_dir, recursive = TRUE) else ret = TRUE
+if (!ret) error_quit("Error, unable to create the output directory.")
+info$output_prefix = if (is.null(option$outprefix)) sub("[.][^.]*$", "", basename(info$input_file)) else option$outprefix
+info$metadata_file = option$database
+if (is.null(info$metadata_file)) error_quit("Error, metadata file should be specificed.")
+if (!file.exists(info$metadata_file)) error_quit("Error, metadata file does not exist.")
+if (!is.null(option$taxonomy)) {
+    info$taxonomy_file = option$taxonomy
+    if (!file.exists(info$taxonomy_file)) error_quit("Error, taxonomy file does not exist.")
+    info$taxonomy_info = read.table(info$taxonomy_file, row.names = 1)
+    info$taxonomy_level = ncol(info$taxonomy_info)
+} else info$taxonomy_level = 0
+info$temp_dir = system(paste0("mktemp -d --tmpdir=", info$output_dir), intern = T) 
+
+info$protein_min_coverage = option$min_coverage
+if (is.na(info$protein_min_coverage) || info$protein_min_coverage <= 0 || info$protein_min_coverage > 1) error_quit("Invalid --min_coverage value.")
+info$protein_min_score = option$min_score
+if (is.na(info$protein_min_score) || info$protein_min_score < 0) error_quit("Invalid --min_score value.")
+info$nearby_sequence_extend = option$seq_extend
+if (is.na(info$nearby_sequence_extend) || info$nearby_sequence_extend <= 0) error_quit("Invalid --seq_extend value.")
+info$min_sequence_length = option$min_seq_len
+if (is.na(info$min_sequence_length) || info$min_sequence_length <= 0) error_quit("Invalid --info$min_sequence_length.")
+
+info$motif_candidate_deduplicate = option$motif_candidate_deduplicate
+info$motif_candidate_min_level = option$motif_candidate_min_level
+if (is.na(info$motif_candidate_min_level) || info$motif_candidate_min_level < 0) error_quit("Invalid --motif_candidate_min_level value.")
+info$motif_candidate_min_count = option$motif_candidate_min_count
+if (is.na(info$motif_candidate_min_count) || info$motif_candidate_min_count < 2) error_quit("Invalid --motif_candidate_min_count value.")
+info$motif_candidate_max_count = option$motif_candidate_max_count
+if (is.na(info$motif_candidate_max_count) || info$motif_candidate_max_count < info$motif_candidate_min_count) error_quit("Invalid --motif_candidate_max_count value.")
+
+info$meme_n_motif = option$meme_n_motif
+if (is.na(info$meme_n_motif) || info$meme_n_motif < 1) error_quit("Invalid --n_motif value.")
+info$meme_motif_eval = option$meme_motif_eval
+if (is.na(info$meme_motif_eval) || info$meme_motif_eval <= 0) error_quit("Invalid --motif_eval value.")
+info$meme_motif_min_site = option$meme_motif_min_site
+if (is.na(info$meme_motif_min_site) || info$meme_motif_min_site < 2) error_quit("Invalid --motif_min_site value.")
+
+info$entropy_pseudocount = option$entropy_pseudocount
+if (is.na(info$entropy_pseudocount) || info$entropy_pseudocount < 0) error_quit("Invalid --entropy_pseudocount value.")
+
+info$cluster_pseudocount = option$cluster_pseudocount
+if (is.na(info$cluster_pseudocount) || info$cluster_pseudocount < 0) error_quit("Invalid --cluster_pseudocount value.")
+info$cluster_base_function = option$cluster_base_function
+if (is.na(info$cluster_base_function) || !(info$cluster_base_function %in% c("0", "1"))) error_quit("Invalid --cluster_base_function value.")
+info$cluster_gap_penalty = option$cluster_gap_penalty
+if (is.na(info$cluster_gap_penalty) || info$cluster_gap_penalty < 0) error_quit("Invalid --cluster_gap_penalty value.")
+info$cluster_edge_penalty = option$cluster_edge_penalty
+if (is.na(info$cluster_edge_penalty) || info$cluster_edge_penalty < 0) error_quit("Invalid --cluster_edge_penalty value.")
+info$cluster_method = option$cluster_method
+if (is.na(info$cluster_method) || !(info$cluster_method %in% c("ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", "centroid"))) error_quit("Invalid --cluster_method value.")
+info$cluster_cutoff = option$cluster_cutoff
+if (is.na(info$cluster_cutoff) || info$cluster_cutoff < 0) error_quit("Invalid --cluster_cutoff value.")
+
+info$msa_analysis = T
+info$msa_candidate_min_level = option$msa_candidate_min_level
+if (is.na(info$msa_candidate_min_level) || info$msa_candidate_min_level < 0) error_quit("Invalid --msa_candidate_min_level value.")
+info$msa_candidate_max_count = option$msa_candidate_max_count
+if (is.na(info$motif_candidate_min_count) || info$motif_candidate_min_count < 1) error_quit("Invalid --msa_candidate_min_count value.")
+info$msa_candidate_min_count = option$msa_candidate_min_count
+if (is.na(info$msa_candidate_max_count) || info$msa_candidate_max_count < info$msa_candidate_min_count) error_quit("Invalid --msa_candidate_max_count value.")
+
+if (info$taxonomy_level < info$motif_candidate_min_level || info$taxonomy_level < info$msa_candidate_min_level) error_quit("Error, the taxonomy file does not provide enough level.")
+info$out_profile = T
+
+#(1)Determine the type of input file and generate hmmer profile.
+info$hmmer_file = file.path(info$temp_dir, paste0(info$output_prefix, ".hmm"))
+info$output_hmmer_file = file.path(info$output_dir, paste0(info$output_prefix, ".hmm"))
+input_lines = readLines(info$input_file)
+line_first = input_lines[input_lines != ""][1]
+if (grepl("^HMMER", line_first)){
+    ret = file.copy(info$input_file, info$hmmer_file, overwrite = T)
+} else if (grepl("^>", line_first)){
+    cat("#Build hmmer profile.\n")
+    hmmbuild_command = conf["hmmbuild_command"]
+    hmmbuild_command = sub("[hmmer_file]", info$hmmer_file, hmmbuild_command, fixed = T)
+    hmmbuild_command = sub("[input_file]", info$input_file, hmmbuild_command, fixed = T)
+    hmmbuild_ret = system(hmmbuild_command, ignore.stdout = T, ignore.stderr = T)
+    if (hmmbuild_ret != 0) error_quit("Error, failed to build hmmer profile from the input.")
+} else error_quit("#Failed to determine the input type.")
+info$domain_size = (function(input_file){
+    lines = readLines(input_file)
+    line = grep("^LENG[ ]*", lines, value = T)
+    domain_size = as.numeric(sub("^LENG[ ]*", "", line))
+    return(domain_size)
+})(info$hmmer_file)
+
+if (info$out_profile) ret = file.copy(info$hmmer_file, info$output_hmmer_file, overwrite = T)
+
+#(2)Search for the protein homologs and prepare upstream and downstream sequences
+cat("#Search for protein homologs and extract nearby sequences.\n")
+info$metadata = read.table(info$metadata_file, sep = "\t", quote = "")
+info$genome_tags = info$metadata$V1
+info$genome_files = info$metadata$V2
+info$genome_index_files = paste0(info$genome_files, ".fai")
+info$protein_files = info$metadata$V3
+info$bed_files = info$metadata$V4
+info$n_genome = nrow(info$metadata)
+
+extract_hmmsearch_result = function(input_file){
+  lines = readLines(input_file)
+  profile_file = sub("# query HMM file:[[:blank:]]*", "", lines[grep("query HMM file:", lines)])
+  domains_start = grep("Domain annotation for each sequence:", lines)+1
+  domains_end = grep("Internal pipeline statistics summary:", lines)-3
+  domains = lines[domains_start: domains_end]
+  domain_start = grep(">>", domains)
+  domain_end = grep("^$", domains)
+  if (length(domain_start) == 0) return(NULL)
+  rets = Map(function(start, end) {
+    if (end - start == 2) return(NULL)
+    lines = domains[start:end]
+    seq_name = sub(">> (.*[^ ]+) *$", "\\1", lines[1])
+    ret = do.call(rbind, strsplit(lines[4:(length(lines)-1)], "[[:blank:]]+"))
+    ret[, 1] <- seq_name
+    return(ret)
+  }, domain_start, domain_end)
+  df = data.frame(do.call(rbind, rets), stringsAsFactors=F)
+  df = data.frame(protein_name = df$X1, protein_score = as.numeric(df$X4), protein_eval = as.numeric(df$X6), hmm_from = as.numeric(df$X8), hmm_to = as.numeric(df$X9))
+  return(df)
+}
+
+protein_list = list()
+sequence_list = list()
+temp_file = system(paste0("mktemp --tmpdir=", info$temp_dir), intern = T)
+cat("#Search for protein homologs and extract nearby sequences.\n")
+for (i in 1:info$n_genome){
+    protein_file = info$protein_files[i]
+    bed_file = info$bed_files[i]
+    genome_file = info$genome_files[i]
+    genome_index_file = info$genome_index_files[i]
+    genome_tag = info$genome_tags[i]
+
+    hmmsearch_command = sub("[n_thread]", info$n_thread, conf["hmmsearch_command"], fixed = T)
+    hmmsearch_command = sub("[hmmer_file]", info$hmmer_file, hmmsearch_command, fixed = T)
+    hmmsearch_command = sub("[protein_file]", protein_file, hmmsearch_command, fixed = T)
+    hmmsearch_command =sub("[output_file]", temp_file, hmmsearch_command, fixed = T)
+    hmmsearch_ret = system(hmmsearch_command, ignore.stderr = TRUE)
+    if (hmmsearch_ret != 0) error_quit(paste0("Error, failed when searching protein homologs for \"", gemome_tag, "\"."))
+
+    unfiltered_proteins = extract_hmmsearch_result(temp_file)
+    if (is.null(unfiltered_proteins)) next
+    proteins = subset(unfiltered_proteins, (protein_score >= info$protein_min_score) & (hmm_to - hmm_from +1)/info$domain_size >= info$protein_min_coverage)
+    if (nrow(proteins) == 0) next
+    proteins$source = genome_tag
+    protein_list[[i]] = proteins
+
+    #(2)Check if the genome index file is presented, if not, build the index file
+    if (!file.exists(genome_index_file)) {
+        build_command = paste("cat /dev/null | bedtools getfasta -fi", genome_file, "-bed - -fo -")
+        build_ret = system(build_command, ignore.stderr = TRUE)
+        if (build_ret != 0) error_quit(paste0("Error, failed when building genome index for \"", gemome_tag,"\"."))
+    }
+
+    #(3)Determine the upstream and downstream sequences
+    bedtools_complement_command = paste("bedtools complement -i ", bed_file, "-g", genome_index_file, ">", temp_file)
+    bedtools_complement_ret = system(bedtools_complement_command, ignore.stderr = TRUE)
+    if (bedtools_complement_ret != 0) error_quit(paste0("Error, failed to determine the intergenic regions for \"", gemome_tag,"\"."))
+    intergenic_regions = read.table(temp_file, sep = "\t", quote = "")
+    bed = read.table(bed_file, sep = "\t", quote = "")
+    bed = subset(bed, V4 %in% proteins$protein_name)
+    backward_index = match(paste0(bed$V1, ":", bed$V2), paste0(intergenic_regions$V1, ":", intergenic_regions$V3))
+    backward_regions = data.frame(name = bed$V4[!is.na(backward_index)], direction = ifelse(bed$V6[!is.na(backward_index)] == "+", "upstream", "downstream"), intergenic_regions[backward_index[!is.na(backward_index)], ], strand = bed$V6[!is.na(backward_index)])
+    backward_regions$V2[backward_regions$V3 - backward_regions$V2 > info$nearby_sequence_extend] = backward_regions$V3 - info$nearby_sequence_extend
+    forward_index = match(paste0(bed$V1, ":", bed$V3), paste0(intergenic_regions$V1, ":", intergenic_regions$V2))
+    forward_regions = data.frame(name = bed$V4[!is.na(forward_index)], direction = ifelse(bed$V6[!is.na(forward_index)] == "+", "downstream", "upstream"), intergenic_regions[forward_index[!is.na(forward_index)], ], strand = bed$V6[!is.na(forward_index)])
+    forward_regions$V3[forward_regions$V3 - forward_regions$V2 > info$nearby_sequence_extend] = forward_regions$V2 + info$nearby_sequence_extend
+    nearby_regions = rbind(backward_regions, forward_regions)
+    nearby_regions = nearby_regions[nearby_regions$V3 - nearby_regions$V2 >= info$min_sequence_length, ] 
+    nearby_regions$source = rep(genome_tag, nrow(nearby_regions))
+    if (nrow(nearby_regions) == 0) next
+    lines = paste(nearby_regions$V1, nearby_regions$V2, nearby_regions$V3, nearby_regions$name, 0, nearby_regions$strand, sep = "\t")
+    bedtools_getfasta_command = paste("bedtools getfasta -name -s -fi", genome_file, "-bed - -fo", temp_file)
+    bedtools_getfasta_ret = system(bedtools_getfasta_command, input = lines, ignore.stderr = TRUE)
+    if (bedtools_getfasta_ret != 0) error_quit(paste0("Error, failed to extract genomic sequences for \"", gemome_tag,"\"."))
+    lines = readLines(temp_file)
+    nearby_regions$sequence = lines[seq(2, length(lines), 2)]
+    sequence_list[[i]] = nearby_regions
+}
+system(paste("rm", temp_file))
+proteins = do.call(rbind, protein_list)
+if (nrow(proteins) == 0) {
+    cat("##No protein homologs are discovered.\n")
+    quit(status = 0)
+}
+proteins$identifier = paste0(proteins$source, "|", proteins$protein_name)
+proteins = proteins[proteins$protein_eval == tapply(proteins$protein_eval, proteins$identifier, min)[proteins$identifier], ]
+proteins = proteins[!duplicated(proteins$identifier), ]
+cat(paste0("##In total ", nrow(proteins), " protein homologs are discovered.\n"))
+
+all_candidates = do.call(rbind, sequence_list)
+if (nrow(all_candidates) == 0) {
+    cat("##No upstream and downstream intergenic sequences are found.\n")
+    quit(status = 0)
+}
+all_candidates$identifier = paste0(all_candidates$source, "|", all_candidates$name)
+cat(paste0("##In total ", sum(all_candidates$direction == "upstream"), " upstream sequences and ", sum(all_candidates$direction == "downstream")," downstream sequences are found.\n"))
+
+candidates_deduplicate = function(sequences){
+    n_sequence = length(sequences)
+    if (n_sequence == 0) return(logical())
+    temp_input_file =  system(paste0("mktemp --tmpdir=", info$temp_dir), intern = T)
+    temp_output_prefix =  system(paste0("mktemp --tmpdir=", info$temp_dir), intern = T)
+    fasta = paste0(">", 1:length(sequences), "\n", sequences)
+    writeLines(fasta, temp_input_file)
+    filter_command = conf["cd-hit-est_command"]
+    filter_command = sub("[n_thread]", info$n_thread, filter_command, fixed = T)
+    filter_command = sub("[input_file]", temp_input_file, filter_command, fixed = T)
+    filter_command = sub("[output_prefix]", temp_output_prefix, filter_command, fixed = T)
+    filter_ret = system(filter_command, ignore.stdout = T, ignore.stderr = T)
+    if (filter_ret != 0) error_quit("Error, failed to deduplicate the candidate sequences before motif search.\n")
+    lines = readLines(temp_output_prefix)
+    selected = rep(F, length(sequences))
+    selected[as.numeric(sub("^>", "", lines[seq(1, length(lines), 2)]))] <- TRUE
+    system(paste("rm", temp_input_file))
+    system(paste("rm", temp_output_prefix))
+    system(paste("rm", paste0(temp_output_prefix, ".clstr")))
+    return(selected)
+}
+
+candidates_filter_taxonomy = function(source, taxonomy_info, min_level, max_count){
+    n_source = length(source)
+    if (n_source == 0) return(logical())
+    shift = function(x) x[order(rnorm(length(x)))]
+    unique_remove_na = function(x) unique(x[!is.na(x)])
+    set.seed(317)
+    random_order = shift(1:n_source)
+    if (!(is.null(taxonomy_info))) ranks = cbind(V1 = -(1:n_source), taxonomy_info[source[random_order], ]) else ranks = data.frame(V1 = -(1:n_source))
+    ranks = ranks[(min_level + 1):ncol(ranks)]
+    unique_count = lengths(lapply(ranks, unique_remove_na))
+    if (unique_count[1] <= max_count) select = !duplicated(ranks[, 1]) & !is.na(ranks[, 1])
+    else if (!any(unique_count <= max_count)) {
+        rank1 = ranks[, ncol(ranks)]
+        used = shift(unique_remove_na(rank1))[1:max_count]
+        select = !duplicated(rank1) & (rank1 %in% used)
+    } else {
+        idx = which(unique_count <= max_count)[1] 
+        rank = ranks[, idx]
+        used1 = ranks[!duplicated(rank) & !is.na(rank), idx - 1]
+        rank = ranks[, idx - 1]
+        used2 = shift(unique_remove_na(rank[!(rank %in% used1)]))[seq_len(max_count - length(used1))]
+        used = c(used1, used2)
+        select = !duplicated(rank) & (rank %in% used)
+    }
+    ret = logical()
+    ret[random_order] = select
+    return(ret)
+}
+
+motif_search = function(candidates, n_motif, eval, min_site){
+    meme_file =  system(paste0("mktemp --tmpdir=", info$temp_dir), intern = T)
+    meme_command = conf["meme_command"]
+    meme_command = sub("[option_evt]", eval, meme_command, fixed = T)
+    meme_command = sub("[option_nmotifs]", n_motif, meme_command, fixed = T)
+    meme_command = sub("[option_minsites]", min_site, meme_command, fixed = T)
+    meme_command = sub("[input_file]", "/dev/stdin", meme_command, fixed = T)
+    meme_command = sub("[output_file]", meme_file, meme_command, fixed = T)
+    meme_input = paste0(">", (1:nrow(candidates))[candidates$selected2],"\n", candidates$sequence[candidates$selected2])
+    meme_ret = system(meme_command, input = meme_input, ignore.stderr = TRUE)
+    if (meme_ret != 0) {
+        cat("Error, failed when running motif search.\n")
+        quit()
+    }
+    lines = readLines(meme_file)
+    motif_template = data.frame(motif = character(), width = numeric(), n_site = numeric(), llr = numeric(), e_value = numeric())
+    motif_lines = lines[grep("^MOTIF", lines)]
+    if (length(motif_lines) == 0) return(NULL)
+    motifs = strcapture("MOTIF *([^ ]*).*width *= *([^ ]*) *sites *= *([^ ]*) *llr *= *([^ ]*) *E-value *= *([^ ]*)", motif_lines, motif_template)
+    dashes = grep("^--------", lines)
+    line_start = grep(" block diagrams$", lines) + 4
+    line_end = sapply(line_start, function(x) min(dashes[dashes > x])) - 1
+    motifs$sites = Map(function(line_start, line_end){
+        sites = read.table(text = lines[line_start:line_end], col.names = c("identifier", "e_value", "diagram"))
+        sites$identifier = candidates$identifier[sites$identifier]
+        sites$l_dist = sapply(strsplit(sites$diagram, "([[+_]|])+"), '[', 1)
+        sites$l_dist[is.na(sites$l_dist)] = "0"
+        sites$l_dist = as.numeric(sites$l_dist)
+        sites$r_dist = sapply(strsplit(sites$diagram, "([[+_]|])+"), '[', 3)
+        sites$r_dist[sites$r_dist == ""] = "0"
+        sites$r_dist = as.numeric(sites$r_dist)
+        return(sites)
+    }, line_start, line_end)
+    line_start=grep("^letter-probability matrix", lines) + 1
+    line_end = sapply(line_start, function(x) min(dashes[dashes > x])) - 1
+    motifs$probability = Map(function(start, end) as.matrix(read.table(text = lines[start:end]), col.names = c("A", "C", "G", "T")), line_start, line_end)
+    system(paste("rm", meme_file))
+    return(motifs)
+}
+
+motif_cluster = function(probabilities, n_site, pseudocount, base_function, gap_panelty, edge_penalty, cluster_method, cluster_cutoff){
+    temp_file =  system(paste0("mktemp --tmpdir=", info$temp_dir), intern = T)
+    cmpmotif_input = unlist(Map(function(probability, n_site, pseudocount){
+        count = round(probability * n_site) + pseudocount
+        return(c(">", paste(count[, 1], count[, 2], count[, 3], count[, 4])))
+    }, probabilities, n_site, pseudocount))
+
+    cmpmotif_command = paste("~/dasRNA/tool/cmpmotif -a /dev/stdin -s", base_function, "-g", gap_panelty, "-e", edge_penalty, ">", temp_file)
+    cmpmotif_ret = system(cmpmotif_command, input = cmpmotif_input)
+    if (cmpmotif_ret != 0) {
+        cat("Error, failed when scoring the similarity between motifs.\n")
+        quit()
+    }
+    similarity = as.matrix(read.table(temp_file))
+    hclust_ret = hclust(as.dist(-similarity), cluster_method)
+    hclust_ret$height = round(hclust_ret$height, 6)
+    cluster = cutree(hclust_ret, h = -cluster_cutoff)
+    system(paste("rm", temp_file))
+    return(cluster)
+}
+
+motif_taxonomy = function(sites, candidates, taxonomy_info){
+    ret = lapply(sites, function(sites){
+        source = candidates$source[match(sites$identifier, candidates$identifier)]
+        n_source = length(source)
+        if (!(is.null(taxonomy_info))) ranks = cbind(V1 = -(1:n_source), taxonomy_info[source[random_order], ]) else ranks = data.frame(V1 = -(1:n_source))
+        return(sapply(ranks, function(x) length(unique(x))))
+    })
+    return(ret)
+}
+
+
+motif_distance = function(sites, direction){
+    if (direction == "upstream") return(sites$r_dist)
+    if (direction == "downstream") return(sites$l_dist)
+    return(NULL)
+}
+
+motif_entropy_score = function(probability, n_site, pseudocount){
+    probability = (probability * n_site + pseudocount)/(n_site + 4 * pseudocount)
+    scores = apply(probability, 1, function(x) 2 + sum(ifelse(x == 0, 0, x * log2(x))))
+    score = sum(scores)
+    return(score)
+}
+
+maf_entropy_score = function(maf, pseudocount){
+    line_start = grep("^>", maf)+1
+    n_seq = length(line_start)
+    line_end = c(line_start[2:n_seq]-2, length(maf))
+    sequences = sapply(1:n_seq, function(i) strsplit(paste0(maf[line_start[i]:line_end[i]], collapse=""), "")[[1]])
+    scores = apply(sequences, 1, function(x) {
+        tbl = table(x)[c('a', 'c', 'g', 't', '-')]
+        names(tbl) = c('a', 'c', 'g', 't', '-')
+        tbl[is.na(tbl)] = 0
+        factor = (1- tbl['-']/length(x))^2
+        base_count = length(x) - tbl['-']+ 4 * pseudocount
+        a = (tbl['a'] + pseudocount)/base_count
+        c = (tbl['c'] + pseudocount)/base_count
+        g = (tbl['g'] + pseudocount)/base_count
+        t = (tbl['t'] + pseudocount)/base_count
+        ent = 2 + (if (a == 0) 0 else a*log2(a)) + (if (c == 0) 0 else c*log2(c)) + (if (g==0) 0 else g*log2(g)) + (if (t==0) 0 else t*log2(t))
+        return(ent * factor)
+    })
+    score = sum(scores)
+    return(score)
+}
+
+reverse_complementary_name = function(names){
+    new_names = ifelse(grepl("[(][+][)]", names), sub("[(][+][)]", "(-)",  names), sub("[(][-][)]", "(+)",  names))
+    return(new_names)
+}
+
+reverse_complementary = function(sequences){
+    bases = strsplit(sequences, "")
+    rc_sequences = sapply(bases, function(x) {
+        x = rev(x)
+        x = c("A" = "T", "T" = "A", "G" = "C", "C" = "G", "N" = "N", "a" = "t", "t" = "a", "g" = "c", "c" = "g", "n" = "n")[x]
+        x[is.na(x)] = "N"
+        rc_sequence = paste0(x, collapse = "")
+        return(rc_sequence)
+    })
+    return(rc_sequences)
+}
+
+count_base_pair = function(lines){
+    ss_line = lines[grepl("#=GC SS_cons", lines)]
+    ss_count = sum(strsplit(ss_line, "")[[1]] == "(")
+    return(ss_count)
+}
+
+count_covariate_base_pair = function(lines){
+    start = grep("# Power analysis of given structure", lines)
+    end = grep("^# BPAIRS", lines)[1]
+    n_cbp = sum(grepl("^[ ]*[*]", lines[start:end]))
+    return(n_cbp)
+}
+
+perform_motif_sequence_analysis = function(input_line, output_dir, output_prefix, pseudocount, analysis_option, output_option){
+    clean_up = function(option){
+        if (option[1]){
+            mafft_file = file.path(output_dir, paste0(output_prefix, ".maf"))
+            if (file.exists(mafft_file)) file.remove(mafft_file)
+        }
+        if (option[2]){
+            stk_file = file.path(output_dir, paste0(output_prefix, ".stk"))
+            if (file.exists(stk_file)) file.remove(stk_file)
+        }
+        if (option[3]){
+            files = list.files(output_dir)
+            files = files[grepl(paste0("^", output_prefix, ".rscape"), files)]
+            file.remove(file.path(output_dir, files))
+        }
+        if (create && length(list.files(output_dir)) == 0) file.remove(output_dir)
+    }
+
+    if (!dir.exists(output_dir)){
+        create = T
+        dir.create(output_dir)
+    } else{
+        create = F
+        clean_up(analysis_option)
+    }
+
+    ret = list()
+    if (analysis_option[1]){
+        mafft_file = file.path(output_dir, paste0(output_prefix, ".maf"))
+        mafft_input = input_line
+        mafft_command = conf["mafft_command"]
+        mafft_command = sub("[input_file]", "/dev/stdin", mafft_command, fixed = T)
+        mafft_command = sub("[output_file]", mafft_file, mafft_command, fixed = T)
+        mafft_ret = system(mafft_command, input = mafft_input, ignore.stderr = T)
+        if (mafft_ret != 0 ) {
+            ret$ret_val = 1
+            output_option[1] = F
+            clean_up(!output_option)
+            return(ret)
+        }
+        maf = readLines(mafft_file)
+        ret$entropy_score = maf_entropy_score(maf, pseudocount)
+    }
+    if (analysis_option[2]){
+        stk_file = file.path(output_dir, paste0(output_prefix, ".stk"))
+        alifold_command = paste0("cd [output_dir] && ", conf["alifold_command"])
+        alifold_command = sub("[output_dir]", output_dir, alifold_command, fixed = T)
+        alifold_command = sub("[output_prefix]", output_prefix, alifold_command, fixed = T)
+        alifold_command = sub("[input_file]", mafft_file, alifold_command, fixed = T)
+        alifold_ret = system(alifold_command, ignore.stdout = T, ignore.stderr = T)
+        if (alifold_ret != 0 ) {
+            ret$ret_val = 2
+            output_option[2] = F
+            clean_up(!output_option)
+            return(ret)
+        }
+        stk = readLines(stk_file)
+        ret$n_bp = count_base_pair(stk)
+    }
+    if (analysis_option[3]){
+        rscape_file = file.path(output_dir, paste0(output_prefix, ".rscape.txt"))
+        rscape_command = paste(conf["rscape_command"])
+        rscape_command = sub("[output_dir]", output_dir, rscape_command, fixed = T)
+        rscape_command = sub("[output_prefix]", paste0(output_prefix, ".rscape"), rscape_command, fixed = T)
+        rscape_command = sub("[input_file]", "/dev/stdin", rscape_command, fixed = T)
+        rscape_command = sub("[output_file]", rscape_file, rscape_command, fixed = T)
+        rscape_ret = system(rscape_command, input = stk)
+        if (rscape_ret != 0 ) {
+            ret$ret_val = 3
+            output_option[3] = F
+            clean_up(!output_option)
+            return(ret)
+        }
+        rscape = readLines(rscape_file)
+        ret$n_cbp = count_covariate_base_pair(rscape)
+    }
+    ret$ret_val = 0
+    clean_up(!output_option)
+    return(ret)
+}
+
+motif_msa = function(motifs, candidates, output_dir, sequence_count, pseudocount, analysis_option, output_option){
+    msa_status = character()
+    msa_ent = character()
+    msa_bp = numeric()
+    msa_cbp = numeric()
+    msa_ent_cv = character()
+    msa_bp_cv = numeric()
+    msa_cbp_cv = numeric()
+    for (i in (1:nrow(motifs))){
+        output_prefix = motifs$name[i]
+        output_prefix_rc = paste0(output_prefix, ".rc")
+        sites = motifs$sites[[i]]
+        select = motifs$select[[i]]
+        if (analysis_option[1]) msa_ent[i] = NA
+        if (analysis_option[1]) msa_ent_cv[i] = NA
+        if (analysis_option[2]) msa_bp[i] = NA
+        if (analysis_option[2]) msa_bp_cv[i] = NA
+        if (analysis_option[3]) msa_cbp[i] = NA
+        if (analysis_option[3]) msa_cbp_cv[i] = NA
+        if (sum(select) < sequence_count){
+            msa_status[i] = "skipped"
+            next
+        }
+        input_line = paste0(">", sites$identifier[select], "\n", candidates$sequence[match(sites$identifier[select], candidates$identifier)])
+        input_line_rc = paste0(">", reverse_complementary_name(sites$identifier[select]), "\n", reverse_complementary(candidates$sequence[match(sites$identifier[select], candidates$identifier)]))
+        ret1 = perform_motif_sequence_analysis(input_line, file.path(output_dir, output_prefix), output_prefix, pseudocount, analysis_option, output_option)
+        ret2 = perform_motif_sequence_analysis(input_line_rc, file.path(output_dir, output_prefix), output_prefix_rc, pseudocount, analysis_option, output_option)
+        if (ret1$ret_val != 0 || ret2$ret_val != 0){
+           status[i] = paste0("failed(", ret1$ret_val, ",", ret2$ret_val, ")")
+        } else {
+           msa_status[i] = "success"
+           if (analysis_option[1]) msa_ent[i] = ret1$entropy_score
+           if (analysis_option[1]) msa_ent_cv[i] = ret2$entropy_score
+           if (analysis_option[2]) msa_bp[i] = ret1$n_bp
+           if (analysis_option[2]) msa_bp_cv[i] = ret2$n_bp
+           if (analysis_option[3]) msa_cbp[i] = ret1$n_cbp
+           if (analysis_option[3]) msa_cbp_cv[i] = ret2$n_cbp
+        }
+    }
+    return(data.frame(msa_status, msa_ent, msa_ent_cv, msa_bp, msa_bp_cv, msa_cbp, msa_cbp_cv))
+}
+
+cat("#Search for motifs from upstream and downstream sequences.\n")
+motifs_list = list()
+candidates_list = list()
+for (direction in c("upstream", "downstream")){
+    candidates = all_candidates[all_candidates$direction == direction, ]
+    if (nrow(candidates) < info$motif_candidate_min_count){
+        cat(paste0("##Number of ", direction, " sequences is below the lower limit, skipped.\n"))
+        next
+    }
+    if (info$motif_candidate_deduplicate) candidates$selected1 = candidates_deduplicate(candidates$sequence) else candidates$selected1 = TRUE
+    candidates$selected2 = FALSE
+    candidates$selected2[candidates$selected1] = candidates_filter_taxonomy(candidates$source[candidates$selected1], info$taxonomy_info, info$motif_candidate_min_level, info$motif_candidate_max_count)
+    if (sum(candidates$selected2) < info$motif_candidate_min_count){
+        cat(paste0("##Number of ", direction, " sequences is below the lower limit after filtering, skipped.\n"))
+        next
+    }
+    motifs = motif_search(candidates, info$meme_n_motif, info$meme_motif_eval, info$meme_motif_min_site)
+    motifs = subset(motifs, n_site >= info$meme_motif_min_site)
+    if (nrow(motifs) == 0){
+        cat(paste0("##No motifs are identified from ", direction, " sequences.\n"))
+        next
+    } else cat(paste0("##", nrow(motifs)," motifs are identified from ", direction, " sequences.\n"))
+    motifs$name = paste0(info$output_prefix, "_", direction, "_", "motif_", 1:nrow(motifs))
+    motifs$cluster  = motif_cluster(motifs$probability, motifs$n_site, info$cluster_pseudocount, info$cluster_base_function, info$cluster_gap_panelty, info$cluster_edge_panelty, info$cluster_method, info$cluster_cutoff)
+    motifs$ranks = motif_taxonomy(motifs$sites, candidates, info$taxonomy_info)
+    motifs$distances =  motif_distance(motifs$sites, direction)
+    motifs$entropy_score = unlist(Map(motif_entropy_score, motifs$probability, motifs$n_site, info$entropy_pseudocount))
+    candidates_list[[direction]] = candidates
+    motifs_list[[direction]] = motifs
+}
+
+cat("#Perform basic analysis for motifs.\n")
+for (direction in c("upstream", "downstream")){
+    motifs = motifs_list[[direction]]
+    if (is.null(motifs)) next
+    candidates = candidates_list[[direction]]
+    motifs$name = paste0(info$output_prefix, "_", direction, "_", "motif_", 1:nrow(motifs))
+    motifs$cluster  = motif_cluster(motifs$probability, motifs$n_site, info$cluster_pseudocount, info$cluster_base_function, info$cluster_gap_panelty, info$cluster_edge_panelty, info$cluster_method, info$cluster_cutoff)
+    motifs$ranks = motif_taxonomy(motifs$sites, candidates, info$taxonomy_info)
+    motifs$distances =  motif_distance(motifs$sites, direction)
+    motifs$entropy_score = unlist(Map(motif_entropy_score, motifs$probability, motifs$n_site, info$entropy_pseudocount))
+    motifs_list[[direction]] = motifs
+}
+
+cat("#Perform multiple sequence alignment analysis for motifs.\n")
+for (direction in c("upstream", "downstream")){
+    motifs = motifs_list[[direction]]
+    if (is.null(motifs)) next
+    candidates = candidates_list[[direction]]
+    if (info$msa_analysis) {
+        motifs$select = lapply(motifs$sites, function(sites) {
+            sources = candidates$source[match(sites$identifier, candidates$identifier)]
+            ret = candidates_filter_taxonomy(sources, info$taxonomy_info, info$msa_candidate_min_level, info$msa_candidate_max_count)
+        })
+        msa_ret = motif_msa(motifs, candidates, info$output_dir, info$msa_candidate_min_count, info$entropy_pseudocount, c(T, T, T), c(T, T, T))
+    }
+    n_msa_fail = sum(grepl("^fail", msa_ret$status))
+    if (n_msa_fail > 0) cat(paste0("##Multiple sequence analysis fail for ", n_msa_fail, " motifs.\n"))
+    motifs = cbind(motifs, msa_ret)
+    motifs_list[[direction]] = motifs
+}
+
+system(paste0("rm -r ", info$temp_dir))
+
+generate_motif_diagram = function(motifs){
+    sites = do.call(rbind, motifs$sites)
+    sites$motif_id = rep(1:nrow(motifs), times = sapply(motifs$sites, nrow))
+    diagrams = tapply(1:nrow(sites), sites$identifier, function(i){
+        sites = sites[i, ]
+        sites = sites[order(sites$l_dist),]
+        pre_len = sites$l_dist[1]
+        post_len = sites$r_dist[nrow(sites)]
+        inter_len = sites$l_dist[-1] - sites$l_dist[-nrow(sites)] - motifs$width[sites$motif_id[-nrow(sites)]]
+        diagram = paste0(paste(c(pre_len, inter_len), paste0("[", sites$motif_id, "]"), sep = "_", collapse = "_"), "_", post_len)
+        return(diagram)
+    })
+    return(diagrams)
+}
+
+generate_sequence_table = function(proteins, direction, candidates, diagrams){
+    matched = match(candidates$identifier, proteins$identifier)
+    sequence_table = proteins
+    sequence_table$status = paste0("no_", direction)
+    sequence_table$status[matched][!(candidates$selected2)] = "filtered"
+    sequence_table$status[matched][candidates$selected2] = "used"
+    sequence_table$chrom = "none"
+    sequence_table$chrom[matched] = candidates$V1
+    sequence_table$start = -1
+    sequence_table$start[matched] = candidates$V2
+    sequence_table$end = -1
+    sequence_table$end[matched] = candidates$V3
+    sequence_table$strand = "."
+    sequence_table$strand[matched] = candidates$strand
+    sequence_table$sequence = ""
+    sequence_table$sequence[matched] = candidates$sequence
+    sequence_table$motif_diagram = diagrams[sequence_table$identifier]
+    searched_but_no_motif = (is.na(sequence_table$motif_diagram) & sequence_table$status == "used")
+    sequence_table$motif_diagram[searched_but_no_motif] = as.character(nchar(sequence_table$sequence[searched_but_no_motif]))
+    sequence_table$motif_diagram[is.na(sequence_table$motif_diagram)] = ""
+    sequence_table$protein_eval = format(sequence_table$protein_eval, scientific = 0)
+    sequence_table$protein_score = format(sequence_table$protein_score, scientific = 100)
+    sequence_table$start = format(sequence_table$start, scientific = 100)
+    sequence_table$end = format(sequence_table$end, scientific = 100)
+    sequence_table = sequence_table[c("source", "protein_name", "protein_score", "protein_eval", "status", "chrom", "start", "end", "strand", "sequence", "motif_diagram")]
+    return(sequence_table)
+}
+
+generate_motif_base_count = function(probabilities, n_site){
+    ret = unlist(Map(function(probability, n_site, index){
+            count = round(probability * n_site)
+            return(c(paste0(">", index), paste(count[, 1], count[, 2], count[, 3], count[, 4])))
+        }, probabilities, n_site, 1:length(n_site)))
+    return(ret)
+} 
+
+generate_motif_table = function(motifs, candidates){
+    motif_table = data.frame(index = 1:nrow(motifs))
+    motif_table$motif = motifs$motif
+    motif_table$width = motifs$width
+    motif_table$n_site = motifs$n_site
+    motif_table$prop = motifs$n_site / sum(candidates$selected2)
+    motif_table$e_value = format(motifs$e_value, scientific = 0)
+    motif_table$cluster = motifs$cluster
+    motif_table$taxonomy = sapply(motifs$ranks, function(x) paste0(x, collapse = ","))
+    motif_table$entropy_score = round(motifs$entropy_score, 2)
+    motif_table$msa_analysis = motifs$msa_status
+    motif_table$msa_n_seq = sapply(motifs$select, sum)
+    motif_table$msa_entropy_score = round(as.numeric(motifs$msa_ent), 2)
+    motif_table$msa_rv_entropy_score = motifs$msa_ent_cv
+    motif_table$msa_base_pair = motifs$msa_bp
+    motif_table$msa_rv_base_pair = motifs$msa_bp_cv
+    motif_table$msa_covariate_base_pair = motifs$msa_cbp
+    motif_table$msa_rv_covariate_base_pair = motifs$msa_cbp_cv
+    return(motif_table)
+}
+
+cat("#Generate output tables.\n")
+for (direction in c("upstream", "downstream")){
+    motifs = motifs_list[[direction]]
+    if (is.null(motifs)) next
+    candidates = candidates_list[[direction]]
+    diagrams = generate_motif_diagram(motifs)
+    sequence_table = generate_sequence_table(proteins, direction, candidates, diagrams)
+    write.table(sequence_table, file.path(info$output_dir, paste0(info$output_prefix, "_", direction, "_sequence.tsv")), quote = F, sep = "\t", row.names = F)
+    motif_base_count = generate_motif_base_count(motifs$probability, motifs$n_site)
+    writeLines(motif_base_count, file.path(info$output_dir, paste0(info$output_prefix, "_", direction, "_motif_matrix.txt")))
+    motif_table = generate_motif_table(motifs, candidates)
+    write.table(motif_table, file.path(info$output_dir, paste0(info$output_prefix, "_", direction, "_motif.tsv")), quote = F, sep = "\t", row.names = F)
+}
+cat("#Finished!\n")
+
+
+
+
