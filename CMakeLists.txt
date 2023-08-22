@@ -3,5 +3,5 @@ project(cmpmotif C)
 
 set(CMAKE_C_STANDARD 99)
 
-add_executable(cmpmotif main.c)
+add_executable(cmpmotif cmpmotif.c)
 target_link_libraries(cmpmotif m)
